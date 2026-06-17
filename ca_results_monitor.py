@@ -1,20 +1,6 @@
 import os
-import ssl
-import socket
-
-# Force IPv4 — Render free tier doesn't support IPv6 outbound,
-# and smtp.gmail.com resolves to IPv6 by default causing
-# "[Errno 101] Network is unreachable"
-_original_getaddrinfo = socket.getaddrinfo
-def _getaddrinfo_ipv4(*args, **kwargs):
-    responses = _original_getaddrinfo(*args, **kwargs)
-    return [r for r in responses if r[0] == socket.AF_INET] or responses
-socket.getaddrinfo = _getaddrinfo_ipv4
 import requests
 from bs4 import BeautifulSoup
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import hashlib
 import json
@@ -33,11 +19,8 @@ app = Flask(__name__)
 
 # Configuration (use environment variables)
 RESULTS_URL = os.getenv('RESULTS_URL', '')
-EMAIL_FROM = os.getenv('EMAIL_FROM', '')
-EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
+RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
 EMAIL_TO = os.getenv('EMAIL_TO', '')
-SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
-SMTP_PORT = int(os.getenv('SMTP_PORT', '465'))
 CHECK_INTERVAL_MINUTES = int(os.getenv('CHECK_INTERVAL_MINUTES', '1'))
 
 # Store previous page hash to detect changes
@@ -94,22 +77,16 @@ def save_snapshot(content_hash):
         logger.error(f"Error saving snapshot: {str(e)}")
 
 def send_email_notification(subject, body):
-    """Send email notification via Gmail SMTP_SSL (port 465)"""
-    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+    """Send email notification via Resend HTTP API (works on Render free tier)"""
+    if not RESEND_API_KEY or not EMAIL_TO:
         logger.error(
-            "Email not configured. Set EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO env vars. "
-            f"Currently: FROM={'SET' if EMAIL_FROM else 'EMPTY'}, "
-            f"PASS={'SET' if EMAIL_PASSWORD else 'EMPTY'}, "
-            f"TO={'SET' if EMAIL_TO else 'EMPTY'}"
+            "Email not configured. Set RESEND_API_KEY and EMAIL_TO env vars. "
+            f"Currently: RESEND_API_KEY={'SET' if RESEND_API_KEY else 'EMPTY'}, "
+            f"EMAIL_TO={'SET' if EMAIL_TO else 'EMPTY'}"
         )
         return False
 
     try:
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_FROM
-        msg['To'] = EMAIL_TO
-        msg['Subject'] = subject
-        
         email_body = (
             f"{body}\n\n"
             f"---\n"
@@ -117,42 +94,30 @@ def send_email_notification(subject, body):
             f"Results URL: {RESULTS_URL}\n\n"
             f"This is an automated notification from your CA Results Monitor."
         )
-        
-        msg.attach(MIMEText(email_body, 'plain', 'utf-8'))
-        
-        # Use SMTP_SSL (port 465) — more reliable on cloud platforms like Render
-        context = ssl.create_default_context()
-        
-        if SMTP_PORT == 465:
-            # Direct SSL connection (recommended)
-            logger.info(f"Connecting to {SMTP_SERVER}:{SMTP_PORT} via SMTP_SSL...")
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
-                server.login(EMAIL_FROM, EMAIL_PASSWORD)
-                server.send_message(msg)
-        else:
-            # Fallback: STARTTLS on port 587
-            logger.info(f"Connecting to {SMTP_SERVER}:{SMTP_PORT} via STARTTLS...")
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15) as server:
-                server.ehlo()
-                server.starttls(context=context)
-                server.ehlo()
-                server.login(EMAIL_FROM, EMAIL_PASSWORD)
-                server.send_message(msg)
-        
-        logger.info(f"✅ Email sent successfully to {EMAIL_TO}")
-        return True
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(
-            f"❌ Gmail authentication failed: {str(e)}. "
-            "Make sure you're using a Gmail App Password (not your regular password). "
-            "Generate one at: https://myaccount.google.com/apppasswords"
+
+        response = requests.post(
+            'https://api.resend.com/emails',
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'from': 'CA Results Monitor <onboarding@resend.dev>',
+                'to': [EMAIL_TO],
+                'subject': subject,
+                'text': email_body
+            },
+            timeout=10
         )
-        return False
-    except smtplib.SMTPException as e:
-        logger.error(f"❌ SMTP error: {str(e)}")
-        return False
+
+        if response.status_code == 200:
+            logger.info(f"✅ Email sent successfully to {EMAIL_TO}")
+            return True
+        else:
+            logger.error(f"❌ Resend API error ({response.status_code}): {response.text}")
+            return False
     except Exception as e:
-        logger.error(f"❌ Unexpected email error ({type(e).__name__}): {str(e)}")
+        logger.error(f"❌ Email error ({type(e).__name__}): {str(e)}")
         return False
 
 def check_results():
@@ -225,12 +190,9 @@ def health():
         'timestamp': datetime.now().isoformat(),
         'config': {
             'results_url': RESULTS_URL or 'NOT SET',
-            'email_from': 'SET' if EMAIL_FROM else 'NOT SET',
+            'resend_api_key': 'SET' if RESEND_API_KEY else 'NOT SET',
             'email_to': 'SET' if EMAIL_TO else 'NOT SET',
-            'email_password': 'SET' if EMAIL_PASSWORD else 'NOT SET',
             'check_interval': CHECK_INTERVAL_MINUTES,
-            'smtp_server': SMTP_SERVER,
-            'smtp_port': SMTP_PORT,
         }
     }), 200
 
@@ -257,12 +219,10 @@ if __name__ == '__main__':
     # Log configuration on startup
     logger.info("=" * 50)
     logger.info("CA Results Monitor Starting...")
-    logger.info(f"  RESULTS_URL: {RESULTS_URL or 'NOT SET'}")
-    logger.info(f"  EMAIL_FROM:  {'SET' if EMAIL_FROM else 'NOT SET'}")
-    logger.info(f"  EMAIL_TO:    {'SET' if EMAIL_TO else 'NOT SET'}")
-    logger.info(f"  EMAIL_PASS:  {'SET' if EMAIL_PASSWORD else 'NOT SET'}")
-    logger.info(f"  SMTP:        {SMTP_SERVER}:{SMTP_PORT}")
-    logger.info(f"  INTERVAL:    {CHECK_INTERVAL_MINUTES} minute(s)")
+    logger.info(f"  RESULTS_URL:     {RESULTS_URL or 'NOT SET'}")
+    logger.info(f"  RESEND_API_KEY:  {'SET' if RESEND_API_KEY else 'NOT SET'}")
+    logger.info(f"  EMAIL_TO:        {'SET' if EMAIL_TO else 'NOT SET'}")
+    logger.info(f"  INTERVAL:        {CHECK_INTERVAL_MINUTES} minute(s)")
     logger.info("=" * 50)
     
     # Run initial check on startup
