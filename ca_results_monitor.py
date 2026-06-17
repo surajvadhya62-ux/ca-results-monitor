@@ -35,15 +35,12 @@ def get_page_content(url):
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
-        # Extract text content for comparison (ignores formatting changes)
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove script and style elements
         for script in soup(["script", "style"]):
             script.decompose()
         
         text = soup.get_text()
-        # Clean up whitespace
         text = ' '.join(text.split())
         
         return text, response.status_code
@@ -128,7 +125,6 @@ def check_results():
         logger.error("RESULTS_URL not configured")
         return
     
-    # Fetch current page content
     content, status_code = get_page_content(RESULTS_URL)
     
     if content is None:
@@ -139,16 +135,11 @@ def check_results():
         )
         return
     
-    # Calculate hash of current content
     current_hash = calculate_hash(content)
-    
-    # Load previous snapshot
     snapshot = load_snapshot()
     previous_hash = snapshot.get('hash')
     
-    # Check for changes
     if previous_hash is None:
-        # First run - just save the snapshot
         save_snapshot(current_hash)
         logger.info("Initial snapshot saved")
         send_email_notification(
@@ -157,7 +148,6 @@ def check_results():
             f"I'll check your results page every {CHECK_INTERVAL_MINUTES} minute(s) and notify you if anything changes."
         )
     elif current_hash != previous_hash:
-        # Content has changed!
         logger.warning("🎉 RESULTS PAGE HAS CHANGED!")
         save_snapshot(current_hash)
         send_email_notification(
@@ -170,6 +160,15 @@ def check_results():
     else:
         logger.info("No changes detected")
 
+def keep_alive():
+    """Ping self to prevent Render free tier from sleeping"""
+    try:
+        port = int(os.getenv('PORT', 5000))
+        requests.get(f'http://localhost:{port}/health', timeout=5)
+        logger.info("🏓 Keep-alive ping sent")
+    except Exception:
+        pass
+
 def start_scheduler():
     """Start the background scheduler"""
     scheduler = BackgroundScheduler()
@@ -179,8 +178,16 @@ def start_scheduler():
         minutes=CHECK_INTERVAL_MINUTES,
         id='ca_results_check'
     )
+    # Ping self every 14 minutes to prevent Render from sleeping
+    scheduler.add_job(
+        keep_alive,
+        'interval',
+        minutes=14,
+        id='keep_alive_ping'
+    )
     scheduler.start()
     logger.info(f"Scheduler started - checking every {CHECK_INTERVAL_MINUTES} minute(s)")
+    logger.info("Keep-alive ping enabled - service will never sleep 💪")
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -216,7 +223,6 @@ def test_email():
     }), 200 if success else 500
 
 if __name__ == '__main__':
-    # Log configuration on startup
     logger.info("=" * 50)
     logger.info("CA Results Monitor Starting...")
     logger.info(f"  RESULTS_URL:     {RESULTS_URL or 'NOT SET'}")
@@ -225,12 +231,8 @@ if __name__ == '__main__':
     logger.info(f"  INTERVAL:        {CHECK_INTERVAL_MINUTES} minute(s)")
     logger.info("=" * 50)
     
-    # Run initial check on startup
     check_results()
-    
-    # Start scheduler
     start_scheduler()
     
-    # Run Flask app
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
